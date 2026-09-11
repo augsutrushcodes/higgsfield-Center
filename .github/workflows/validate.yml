@@ -1,0 +1,79 @@
+name: validate
+
+# Runs the skill-library health check on every push and PR so frontmatter,
+# routing-parity and broken-link regressions are caught automatically instead
+# of relying on a contributor remembering to run the script by hand.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No dependencies — validate.py is pure stdlib. If that ever stops being
+      # true, add the install step here rather than importing quietly.
+
+      - name: Run scripts/validate.py
+        run: python3 scripts/validate.py
+
+      - name: Validator self-check
+        # The validator is the repo's only gate, so assert its contract in both
+        # directions — a validator that silently stopped checking would
+        # otherwise pass forever. Each case greps for the SPECIFIC expected
+        # failure, not just a non-zero exit, so one broken check can't be
+        # masked by an unrelated one.
+        run: |
+          set -eu
+          tmp=$(mktemp -d)
+          cp -r . "$tmp/repo"
+          cd "$tmp/repo"
+
+          expect_failure() {   # $1 = description, $2 = substring to find
+            if out=$(python3 scripts/validate.py 2>&1); then
+              echo "expected FAIL ($1) but the validator passed"; exit 1
+            fi
+            case "$out" in
+              *"$2"*) echo "ok: $1" ;;
+              *) echo "validator failed, but not for: $1"; echo "$out"; exit 1 ;;
+            esac
+          }
+
+          # Case 1 — a platform on disk that the dispatcher does not route.
+          # printf, not an indented heredoc: leading whitespace would break
+          # frontmatter parsing and mask the parity check being tested.
+          mkdir -p skills/orphan
+          printf '%s\n' \
+            '---' \
+            'name: hfc-orphan' \
+            'description: unrouted platform proving the parity check fires' \
+            'metadata:' \
+            '  version: 0.0.1' \
+            '  updated: 2026-01-01' \
+            '  parent: higgsfield-center' \
+            '  status: draft' \
+            '---' > skills/orphan/SKILL.md
+          expect_failure "unrouted platform" "not routed from SKILL.md"
+          rm -rf skills/orphan
+
+          # Case 2 — a sub-skill name missing the hfc- prefix.
+          sed -i 's/^name: hfc-luma$/name: luma/' skills/luma/SKILL.md
+          expect_failure "missing hfc- prefix" "must use the \`hfc-\` prefix"
+          git checkout -- skills/luma/SKILL.md 2>/dev/null || \
+            sed -i 's/^name: luma$/name: hfc-luma/' skills/luma/SKILL.md
+
+          # Case 3 — a broken relative link.
+          printf '\n[dangling](knowledge/does-not-exist.md)\n' >> SKILL.md
+          expect_failure "broken relative link" "broken link"
+
+          echo "validator self-check OK"
